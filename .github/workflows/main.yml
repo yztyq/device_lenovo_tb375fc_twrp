@@ -144,12 +144,13 @@ jobs:
       run: |
         set -e
         mkdir -p "$GITHUB_WORKSPACE/artifacts"
-        ( set -o pipefail; repo sync -j4 --force-sync --no-clone-bundle --no-tags 2>&1 \
-            | tee "$GITHUB_WORKSPACE/artifacts/build.log" ) &
+        LOG="$GITHUB_WORKSPACE/artifacts/repo-sync.log"
+        : > "$LOG"
+        ( set -o pipefail; repo sync -j4 --force-sync --no-clone-bundle --no-tags 2>&1 | tee "$LOG" ) &
         sync_pid=$!
         (
           while kill -0 "$sync_pid" 2>/dev/null; do
-            echo "Sync heartbeat $(date -u +%Y-%m-%dT%H:%M:%SZ) | .repo=$(du -sh .repo 2>/dev/null | cut -f1) | disk=$(df -h / | awk 'NR==2{print $4}') | last: $(tail -n 1 "$GITHUB_WORKSPACE/artifacts/build.log" | cut -c1-140)"
+            echo "Sync heartbeat $(date -u +%Y-%m-%dT%H:%M:%SZ) | .repo=$(du -sh .repo 2>/dev/null | cut -f1) | disk=$(df -h / | awk 'NR==2{print $4}') | last: $(tail -n 1 "$LOG" | cut -c1-140)"
             sleep 60
           done
         ) &
@@ -192,8 +193,27 @@ jobs:
     - name: Sync Device Dependencies
       timeout-minutes: 60
       run: |
-        bash ${GITHUB_WORKSPACE}/scripts/convert.sh ${{ github.event.inputs.DEVICE_PATH }}/${{ steps.buildtree.outputs.value }}.dependencies
-        repo sync -j4
+        set -u
+        DEPS="${{ github.event.inputs.DEVICE_PATH }}/${{ steps.buildtree.outputs.value }}.dependencies"
+        echo "=== dependencies file: $DEPS ==="
+        if [ -f "$DEPS" ]; then
+          cat "$DEPS"
+        else
+          echo "::warning::$DEPS 不存在，无依赖需要同步"
+        fi
+        CONV=""
+        for c in "$GITHUB_WORKSPACE/scripts/convert.sh" "scripts/convert.sh" \
+                 "vendor/twrp/scripts/convert.sh" "bootable/recovery/scripts/convert.sh"; do
+          if [ -f "$c" ]; then CONV="$c"; break; fi
+        done
+        if [ -n "$CONV" ] && [ -f "$DEPS" ]; then
+          echo "=== using $CONV ==="
+          bash "$CONV" "$DEPS"
+        else
+          echo "::notice::convert.sh 未命中（已查 GITHUB_WORKSPACE/scripts、scripts、vendor/twrp/scripts、bootable/recovery/scripts），跳过依赖转换"
+        fi
+        echo "=== final repo sync ==="
+        repo sync -j4 --no-clone-bundle --no-tags
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
       continue-on-error: true
 
@@ -249,7 +269,10 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: build-log-${{ github.run_id }}
-        path: artifacts/build.log
+        path: |
+          artifacts/repo-sync.log
+          artifacts/build.log
+        if-no-files-found: warn
         retention-days: 7
 
     - name: Upload to Release
