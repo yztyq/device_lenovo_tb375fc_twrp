@@ -1,168 +1,267 @@
-/*
- * Copyright (C) 2019 The Android Open Source Project
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-#include <cstdint>
-#define LOG_TAG "android.hardware.boot@1.2-mtkimpl"
+name: Recovery Build
 
-#include <memory>
+on:
+  workflow_dispatch:
+    inputs:
+      MANIFEST_URL:
+        description: 'MANIFEST_URL (if want to use SSH keys, use git@github.com:XXXXX)'
+        required: true
+        default: 'https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp'
+      MANIFEST_BRANCH:
+        description: 'MANIFEST_BRANCH'
+        required: true
+        default: 'twrp-12.1'
+      DEVICE_TREE_URL:
+        description: 'DEVICE_TREE_URL'
+        required: true
+        default: 'https://github.com/2426120557/tb375fc'
+      DEVICE_TREE_BRANCH:
+        description: 'DEVICE_TREE_BRANCH'
+        required: true
+        default: 'main'
+      DEVICE_PATH:
+        description: 'DEVICE_PATH'
+        required: true
+        default: 'device/lenovo/tb375fc'
+      COMMON_TREE_URL:
+        description: 'COMMON_TREE_URL (if no common tree, leave blank)'
+        required: false
+      COMMON_PATH:
+        description: 'COMMON_PATH (if no common tree, leave blank)'
+        required: false
+      DEVICE_NAME:
+        description: 'DEVICE_NAME'
+        required: true
+        default: 'tb375fc'
+      MAKEFILE_NAME:
+        description: 'MAKEFILE_NAME'
+        required: true
+        default: 'twrp_tb375fc'
+      BUILD_TARGET:
+        description: 'BUILD_TARGET'
+        required: true
+        default: 'vendorboot'
 
-#include <log/log.h>
-#include <android-base/logging.h>
-#include <bootloader_message/bootloader_message.h>
+jobs:
+  build:
+    if: github.event.repository.owner.id == github.event.sender.id
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    env:
+      # 任何需要输入账号/密码的 git 操作直接失败，绝不在 CI 里静默等待
+      GIT_TERMINAL_PROMPT: 0
+      GIT_ASKPASS: /bin/true
+      DEBIAN_FRONTEND: noninteractive
+    permissions:
+      contents: write
+    steps:
+    - name: Display Run Parameters
+      run: |
+        echo "::group::User Environment Variables"
+        echo "Manifest URL: ${{ github.event.inputs.MANIFEST_URL }}"
+        echo "Manifest Branch: ${{ github.event.inputs.MANIFEST_BRANCH }}"
+        echo "Device Tree URL: ${{ github.event.inputs.DEVICE_TREE_URL }}"
+        echo "Device Tree Branch: ${{ github.event.inputs.DEVICE_TREE_BRANCH }}"
+        echo "Device Path: ${{ github.event.inputs.DEVICE_PATH }}"
+        echo "Device Name: ${{ github.event.inputs.DEVICE_NAME }}"
+        echo "Makefile Name: ${{ github.event.inputs.MAKEFILE_NAME }}"
+        echo "Build Target: ${{ github.event.inputs.BUILD_TARGET }}.img"
+        echo "::endgroup::"
+        df -h
+        free -h
 
-#include "BootControl.h"
-#include "boot_region_control_private.h"
-#include "boot_control_definition.h"
+    # You might want to Checkout your repo first, but not mandatory
+    - name: Check Out
+      uses: actions/checkout@v4
 
-namespace android {
-namespace hardware {
-namespace boot {
-namespace V1_2 {
-namespace implementation {
+    # Cleanup The Actions Workspace Using Custom Composite Run Actions
+    - name: Cleanup
+      uses: rokibhasansagar/slimhub_actions@main
+      timeout-minutes: 10
+      # That's it! Now use your normal steps
 
-using ::android::hardware::boot::V1_0::CommandResult;
-using namespace android::bootable;
+    - name: Prepare the environment
+      timeout-minutes: 30
+      run: |
+        set -e
+        export DEBIAN_FRONTEND=noninteractive
+        export TZ=Asia/Shanghai
+        sudo apt-get update -y
+        sudo apt-get install -y --no-install-recommends \
+          bc bison build-essential ccache curl flex g++-multilib gcc-multilib \
+          git gnupg gperf imagemagick lib32z1-dev libelf-dev liblz4-tool \
+          libncurses-dev libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop \
+          pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev \
+          unzip python3 python-is-python3 libbz2-dev lzma tree
+        # 可选包装一个装一个，装不上就跳过，绝不因一个缺包把整条流水线卡死
+        for p in gcc-10-multilib g++-10-multilib lib32ncurses-dev lib32readline-dev \
+                   libwxgtk3.0-gtk3-dev libncurses5 libgl1-mesa-dev x11proto-core-dev \
+                   libx11-dev ncftp qemu-user-static libstdc++-10-dev; do
+          sudo apt-get install -y --no-install-recommends "$p" \
+            || echo "::warning::optional package not installed: $p"
+        done
+        echo "=== toolchain ==="
+        gcc --version | head -1
+        g++ --version | head -1
+        make --version | head -1
 
-bool BootControl::Init() {
-    return impl_.Init();
-}
+    - name: Install OpenJDK
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'zulu'
+        java-version: '8'
 
-// Methods from ::android::hardware::boot::V1_0::IBootControl follow.
-Return<uint32_t> BootControl::getNumberSlots() {
-    return impl_.GetNumberSlots();
-}
+    - name: Setup SSH Keys
+      if: ${{ startsWith(github.event.inputs.MANIFEST_URL, 'git@github.com') }}
+      uses: webfactory/ssh-agent@v0.9.0
+      with:
+          ssh-private-key: |
+              ${{ secrets.SSH_PRIVATE_KEY }}
 
-Return<uint32_t> BootControl::getCurrentSlot() {
-    return impl_.GetCurrentSlot();
-}
+    - name: Install repo
+      run: |
+        mkdir -p "$HOME/bin"
+        curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo > "$HOME/bin/repo"
+        chmod a+x "$HOME/bin/repo"
+        echo "$HOME/bin" >> "$GITHUB_PATH"
+        "$HOME/bin/repo" --version
 
-Return<void> BootControl::clearAvbbctlFlag() {
-  std::string err;
-  std::string device = get_bootloader_message_blk_device(&err);
-  if (device.empty()) {
-    LOG(ERROR) << "Could not find bootloader message block device: " << err;
-    return Void();
-  }
+    - name: Initialize repo
+      timeout-minutes: 30
+      run: |
+        set -e
+        mkdir -p workspace
+        cd workspace
+        echo "workspace-folder=$(pwd)" >> "$GITHUB_OUTPUT"
+        git config --global user.name "Nico170420"
+        git config --global user.email "b170420nc@gmail.com"
+        repo init --depth=1 -u ${{ github.event.inputs.MANIFEST_URL }} -b ${{ github.event.inputs.MANIFEST_BRANCH }}
+      id: pwd
 
-  bootloader_control boot_ctrl;
-  if (!LoadBootloaderControl(device, &boot_ctrl)) {
-    LOG(ERROR) << "Failed to load bootloader control block";
-    return Void();
-  }
+    - name: Repo Sync
+      timeout-minutes: 150
+      working-directory: workspace
+      run: |
+        set -e
+        mkdir -p "$GITHUB_WORKSPACE/artifacts"
+        ( set -o pipefail; repo sync -j4 --force-sync --no-clone-bundle --no-tags 2>&1 \
+            | tee "$GITHUB_WORKSPACE/artifacts/build.log" ) &
+        sync_pid=$!
+        (
+          while kill -0 "$sync_pid" 2>/dev/null; do
+            echo "Sync heartbeat $(date -u +%Y-%m-%dT%H:%M:%SZ) | .repo=$(du -sh .repo 2>/dev/null | cut -f1) | disk=$(df -h / | awk 'NR==2{print $4}') | last: $(tail -n 1 "$GITHUB_WORKSPACE/artifacts/build.log" | cut -c1-140)"
+            sleep 60
+          done
+        ) &
+        hb_pid=$!
+        set +e
+        wait "$sync_pid"
+        sync_status=$?
+        kill "$hb_pid" 2>/dev/null || true
+        wait "$hb_pid" 2>/dev/null || true
+        set -e
+        echo "repo sync exit=$sync_status"
+        test "$sync_status" -eq 0
 
-  uint32_t computed_crc32 = BootloaderControlLECRC(&boot_ctrl);
-  if (boot_ctrl.crc32_le == computed_crc32 &&  boot_ctrl.reserved1[0] == 1) {
-    boot_ctrl.reserved1[0] = 0;
-    LOG(INFO) << "Clear avb boot control convert flag";
-    UpdateAndSaveBootloaderControl(device, &boot_ctrl);
-  }
-  return Void();
-}
+    - name: Clone device tree
+      timeout-minutes: 15
+      run: |
+        set -e
+        rm -rf "./${{ github.event.inputs.DEVICE_PATH }}"
+        git clone --depth=1 ${{ github.event.inputs.DEVICE_TREE_URL }} -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} ./${{ github.event.inputs.DEVICE_PATH }}
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
 
-Return<void> BootControl::markBootSuccessful(markBootSuccessful_cb _hidl_cb) {
-    struct CommandResult cr;
-    if (impl_.MarkBootSuccessful()) {
-        cr.success = true;
-        cr.errMsg = "Success";
-        clearAvbbctlFlag();
-    } else {
-        cr.success = false;
-        cr.errMsg = "Operation failed";
-    }
-    _hidl_cb(cr);
-    return Void();
-}
+    - name: Clone common tree
+      timeout-minutes: 15
+      if: |
+        github.event.inputs.COMMON_TREE_URL != null
+        && github.event.inputs.COMMON_PATH != null
+      run: |
+        set -e
+        git clone ${{ github.event.inputs.COMMON_TREE_URL }} -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} ./${{ github.event.inputs.COMMON_PATH }}
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
 
-Return<void> BootControl::setActiveBootSlot(uint32_t slot, setActiveBootSlot_cb _hidl_cb) {
-    struct CommandResult cr;
-    if (impl_.SetActiveBootSlot(slot) && implext_.SetBootRegionSlot(slot)) {
-        cr.success = true;
-        cr.errMsg = "Success";
-    } else {
-        cr.success = false;
-        cr.errMsg = "Operation failed";
-    }
-    _hidl_cb(cr);
-    return Void();
-}
+    - name: Check Build Tree
+      uses: haya14busa/action-cond@v1
+      id: buildtree
+      with:
+        cond: ${{ github.event.inputs.MANIFEST_BRANCH == 'twrp-11' || github.event.inputs.MANIFEST_BRANCH == 'twrp-12.1' }}
+        if_true: twrp
+        if_false: omni
 
-Return<void> BootControl::setSlotAsUnbootable(uint32_t slot, setSlotAsUnbootable_cb _hidl_cb) {
-    struct CommandResult cr;
-    if (impl_.SetSlotAsUnbootable(slot)) {
-        cr.success = true;
-        cr.errMsg = "Success";
-    } else {
-        cr.success = false;
-        cr.errMsg = "Operation failed";
-    }
-    _hidl_cb(cr);
-    return Void();
-}
+    - name: Sync Device Dependencies
+      timeout-minutes: 60
+      run: |
+        bash ${GITHUB_WORKSPACE}/scripts/convert.sh ${{ github.event.inputs.DEVICE_PATH }}/${{ steps.buildtree.outputs.value }}.dependencies
+        repo sync -j4
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+      continue-on-error: true
 
-Return<BoolResult> BootControl::isSlotBootable(uint32_t slot) {
-    if (!impl_.IsValidSlot(slot)) {
-        return BoolResult::INVALID_SLOT;
-    }
-    return impl_.IsSlotBootable(slot) ? BoolResult::TRUE : BoolResult::FALSE;
-}
+    - name: Set Swap Space
+      timeout-minutes: 15
+      run: |
+        sudo swapoff -a || true
+        sudo rm -f /swapfile
+        sudo fallocate -l 12G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=12288
+        sudo chmod 600 /swapfile
+        sudo mkswap /swapfile
+        sudo swapon /swapfile || echo "::warning::swap 未启用，继续构建"
+        free -h
+        df -h
 
-Return<BoolResult> BootControl::isSlotMarkedSuccessful(uint32_t slot) {
-    if (!impl_.IsValidSlot(slot)) {
-        return BoolResult::INVALID_SLOT;
-    }
-    return impl_.IsSlotMarkedSuccessful(slot) ? BoolResult::TRUE : BoolResult::FALSE;
-}
+    - name: Building recovery
+      timeout-minutes: 300
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+      run: |
+        set -e
+        mkdir -p "$GITHUB_WORKSPACE/artifacts"
+        LOG="$GITHUB_WORKSPACE/artifacts/build.log"
+        source build/envsetup.sh
+        export ALLOW_MISSING_DEPENDENCIES=true
+        export LC_ALL=C
+        lunch ${{ github.event.inputs.MAKEFILE_NAME }}-eng
+        echo "=== clean ==="
+        make clean || true
+        echo "=== build $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
+        ( set -o pipefail; make ${{ github.event.inputs.BUILD_TARGET }}image -j"$(nproc --all)" 2>&1 | tee "$LOG" ) &
+        build_pid=$!
+        (
+          while kill -0 "$build_pid" 2>/dev/null; do
+            echo "Build heartbeat $(date -u +%Y-%m-%dT%H:%M:%SZ) | mem=$(free -m | awk '/Mem:/{print $7"MB"}') | disk=$(df -h / | awk 'NR==2{print $4}') | last: $(tail -n 1 "$LOG" | cut -c1-140)"
+            sleep 120
+          done
+        ) &
+        hb_pid=$!
+        set +e
+        wait "$build_pid"
+        build_status=$?
+        kill "$hb_pid" 2>/dev/null || true
+        wait "$hb_pid" 2>/dev/null || true
+        set -e
+        echo "build exit=$build_status"
+        echo "=== tail ==="
+        tail -n 40 "$LOG" || true
+        test "$build_status" -eq 0
+        ls -l "out/target/product/${{ github.event.inputs.DEVICE_NAME }}/" || true
 
-Return<void> BootControl::getSuffix(uint32_t slot, getSuffix_cb _hidl_cb) {
-    hidl_string ans;
-    const char* suffix = impl_.GetSuffix(slot);
-    if (suffix) {
-        ans = suffix;
-    }
-    _hidl_cb(ans);
-    return Void();
-}
+    - name: Upload build log
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-log-${{ github.run_id }}
+        path: artifacts/build.log
+        retention-days: 7
 
-// Methods from ::android::hardware::boot::V1_1::IBootControl follow.
-Return<bool> BootControl::setSnapshotMergeStatus(MergeStatus status) {
-    return impl_.SetSnapshotMergeStatus(status);
-}
-
-Return<MergeStatus> BootControl::getSnapshotMergeStatus() {
-    return impl_.GetSnapshotMergeStatus();
-}
-
-// Methods from ::android::hardware::boot::V1_2::IBootControl follow.
-Return<uint32_t> BootControl::getActiveBootSlot() {
-    if (!impl_.GetActiveBootSlot()) {
-        return 0;
-    }
-    return impl_.GetActiveBootSlot();
-}
-
-IBootControl* HIDL_FETCH_IBootControl(const char* /* hal */) {
-    auto module = std::make_unique<BootControl>();
-    if (!module->Init()) {
-        ALOGE("Could not initialize BootControl module");
-        return nullptr;
-    }
-    return module.release();
-}
-
-}  // namespace implementation
-}  // namespace V1_2
-}  // namespace boot
-}  // namespace hardware
-}  // namespace android
+    - name: Upload to Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: workspace/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/vendor_boot.img
+        name: ${{ github.event.inputs.DEVICE_NAME }}-${{ github.run_id }}
+        tag_name: ${{ github.run_id }}
+        body: |
+          Manifest: ${{ github.event.inputs.MANIFEST_BRANCH }}
+          Device: ${{ github.event.inputs.DEVICE_NAME }}
+          Target: vendor_boot.img
+          Version: Android14
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
