@@ -13,12 +13,3 @@ Shipped Android Version | 14
 Storage | 128/256 GB
 Battery | 10600 mAh, Li-Polymer
 
-## Features
-
-Works:
-- [X] ADB
-- [X] Display
-- [X] Touch 
-- [X] Fastbootd
-- [X] USB OTG
-
