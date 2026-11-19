@@ -98,10 +98,23 @@ service vendor.gatekeeper /vendor/bin/hw/android.hardware.gatekeeper-service.bea
     env LD_LIBRARY_PATH /vendor/lib64:/system/lib64
     disabled
 
-# late-fs 之后再拉起：此时 /vendor、/metadata 挂载与属性均已就绪
-on late-fs
-    mkdir /tmp/misc 0770 system system
-    mkdir /tmp/misc/keystore 0770 system system
+# 拉起时机说明（AOSP 14 init 实证）：
+#   init 只触发 early-init/init/late-init(early-fs,fs,post-fs,post-fs-data,
+#   firmware_mounts_complete,early-boot,boot)，**没有 late-fs 事件**
+#   （system/core/init/builtins.cpp 全文无 QueryEventTrigger("late-fs")），
+#   所以这里不能挂 on late-fs，否则永不执行。
+#   post-fs-data 在 late-init 链中、早于 boot(class_start default 拉起 recovery
+#   主程序)，可保证 TWRP 发起解密前 KeyMint 已就绪；
+#   /vendor 与 /metadata 都是 first_stage_mount，此时已挂载。
+on post-fs-data
+    start teei_daemon
+    start keystore2
+    start vendor.keymint-beanpod
+    start vendor.gatekeeper
+
+# 兜底：若 post-fs-data 阶段 TEE 尚未就绪导致服务退出，boot 阶段再拉一次
+# （init 对被 disabled 的服务需显式 start；已在运行的服务 start 为无操作）
+on boot
     start teei_daemon
     start keystore2
     start vendor.keymint-beanpod
