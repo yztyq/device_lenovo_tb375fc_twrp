@@ -388,7 +388,12 @@ jobs:
           exit 1
         fi
         echo "  兼容头 helper 数量: $FUNCS（get_policy_size / get_policy_descriptor / get_policy / fscrypt_policy_size / get_policy_content）"
-        grep -rn '#include "fscrypt_policy.h"' "$LT" && { echo "::error::仍有文件 include 的是旧头"; exit 1; } || echo "  include 已全部替换"
+        BAD=$(grep -rl '#include "fscrypt_policy.h"' "$LT" --include='*.c' --include='*.h' 2>/dev/null | grep -v 'fscrypt_compat.h' || true)
+        if [ -n "$BAD" ]; then
+          echo "::error::仍有文件 include 的是旧头: $BAD"
+          exit 1
+        fi
+        echo "  include 已全部替换（兼容头自身保留对 fscrypt_policy.h 的引用）"
         grep -n 'fscrypt_policy_get_struct(realname, &t->th_buf.fep->v2)' "$LT/append.c" || { echo "::error::append.c get_struct 未替换"; exit 1; }
         grep -n 'lookup_ref_key(&t->th_buf.fep->v2' "$LT/append.c" || { echo "::error::append.c lookup_ref_key 未替换"; exit 1; }
         grep -n 'lookup_ref_tar((const uint8_t\*)get_policy_descriptor(t->th_buf.fep)' "$LT/extract.c" || { echo "::error::extract.c lookup_ref_tar 未替换"; exit 1; }
