@@ -65,3 +65,44 @@ on boot
     start health-hal-2-1
     start overrideprops
     setprop sys.usb.config adb
+
+# ============================================================
+# FBE / metadata 解密支撑（联想 TB375FC，MT6897 + MicroTrust TEEI）
+# 二进制与依赖库由原厂 super.img 的 vendor 分区提取，
+# 安装路径与真机 /vendor 完全一致（/vendor/bin/hw、/vendor/lib64）。
+# ============================================================
+
+# MicroTrust TEE 用户态守护进程（TEE 固件由内核从 tee 分区加载，此进程负责与 TEE 通信）
+service teei_daemon /vendor/bin/teei_daemon
+    class core
+    user root
+    group system
+    seclabel u:r:recovery:s0
+    env LD_LIBRARY_PATH /vendor/lib64:/system/lib64
+
+# beanpod KeyMint HAL：vold 通过 keystore2 取 metadata/DE 密钥时的真正后端
+service vendor.keymint-beanpod /vendor/bin/hw/android.hardware.security.keymint@3.0-service.beanpod
+    class early_hal
+    user nobody
+    group nobody
+    seclabel u:r:recovery:s0
+    env LD_LIBRARY_PATH /vendor/lib64:/system/lib64
+    disabled
+
+# beanpod Gatekeeper HAL：CE（锁屏密码）解锁时校验凭据用
+service vendor.gatekeeper /vendor/bin/hw/android.hardware.gatekeeper-service.beanpod
+    class hal
+    user system
+    group system
+    seclabel u:r:recovery:s0
+    env LD_LIBRARY_PATH /vendor/lib64:/system/lib64
+    disabled
+
+# late-fs 之后再拉起：此时 /vendor、/metadata 挂载与属性均已就绪
+on late-fs
+    mkdir /tmp/misc 0770 system system
+    mkdir /tmp/misc/keystore 0770 system system
+    start teei_daemon
+    start keystore2
+    start vendor.keymint-beanpod
+    start vendor.gatekeeper
