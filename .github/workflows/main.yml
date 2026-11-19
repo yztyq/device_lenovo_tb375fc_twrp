@@ -247,6 +247,155 @@ jobs:
           bootable system device vendor hardware external 2>/dev/null | head -20 || true
         echo "--- 扫描结束 ---"
 
+    - name: Patch libtar fscrypt API (vold 14)
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+      run: |
+        set -e
+        LT=bootable/recovery/libtar
+        if [ ! -d "$LT" ]; then
+          echo "::error::找不到 $LT"
+          exit 1
+        fi
+
+        echo "=== 1. 写入 fscrypt 兼容头 ==="
+        cat > "$LT/fscrypt_compat.h" <<'CEOF'
+        #ifndef TWRP_FSCRYPT_COMPAT_H
+        #define TWRP_FSCRYPT_COMPAT_H
+
+        /* Android 12.1 时代的 vold fscrypt C API 兼容层。
+         * 背景：TWRP 14.1 的 bootable/recovery/libtar 仍按 vold android-12.1 的接口编写
+         *       （union 型 fscrypt_policy、get_policy_size、get_policy_descriptor、
+         *        lookup_ref_tar(fep, policy)），而 vold android-14.1 已删除这些，
+         *        只保留 v1/v2 重载。此文件把它们按老语义补回来。
+         */
+
+        #include <stdbool.h>
+        #include <stddef.h>
+        #include <stdint.h>
+        #include <stdio.h>
+        #include <linux/fs.h>
+
+        #include "fscrypt_policy.h"
+
+        #ifndef FSCRYPT_POLICY_V1
+        #define FSCRYPT_POLICY_V1 0
+        #endif
+        #ifndef FSCRYPT_POLICY_V2
+        #define FSCRYPT_POLICY_V2 2
+        #endif
+        #ifndef FS_KEY_DESCRIPTOR_SIZE
+        #define FS_KEY_DESCRIPTOR_SIZE 8
+        #endif
+        #ifndef FS_KEY_DESCRIPTOR_SIZE_HEX
+        #define FS_KEY_DESCRIPTOR_SIZE_HEX (2 * FS_KEY_DESCRIPTOR_SIZE + 1)
+        #endif
+        #ifndef FSCRYPT_KEY_IDENTIFIER_SIZE
+        #define FSCRYPT_KEY_IDENTIFIER_SIZE 16
+        #endif
+        #ifndef FSCRYPT_KEY_IDENTIFIER_SIZE_HEX
+        #define FSCRYPT_KEY_IDENTIFIER_SIZE_HEX ((2 * FSCRYPT_KEY_IDENTIFIER_SIZE) + 1)
+        #endif
+
+        #undef fscrypt_policy
+        typedef union fscrypt_policy {
+        	uint8_t version;
+        	struct fscrypt_policy_v1 v1;
+        	struct fscrypt_policy_v2 v2;
+        } fscrypt_policy;
+
+        /* Android 14.1 的 vold 头里宏已自带 "2" 前缀，这里还原成 12.1 的写法，
+           以免 libtar 拼出 "22CE" 这类对不上的字符串。 */
+        #undef USER_CE_FSCRYPT_POLICY
+        #undef USER_DE_FSCRYPT_POLICY
+        #undef SYSTEM_DE_FSCRYPT_POLICY
+        #define USER_CE_FSCRYPT_POLICY "CE"
+        #define USER_DE_FSCRYPT_POLICY "DE"
+        #define SYSTEM_DE_FSCRYPT_POLICY "DK"
+
+        static inline uint8_t* get_policy_descriptor(fscrypt_policy* fep)
+        {
+        	if (!fep) return NULL;
+        	if (fep->version == FSCRYPT_POLICY_V1) return fep->v1.master_key_descriptor;
+        	if (fep->version == FSCRYPT_POLICY_V2) return fep->v2.master_key_identifier;
+        	return NULL;
+        }
+
+        static inline uint8_t get_policy_size(fscrypt_policy* fep, bool hex)
+        {
+        	if (!fep) return 0;
+        	if (fep->version == FSCRYPT_POLICY_V1)
+        		return (uint8_t)(hex ? FS_KEY_DESCRIPTOR_SIZE_HEX : FS_KEY_DESCRIPTOR_SIZE);
+        	if (fep->version == FSCRYPT_POLICY_V2)
+        		return (uint8_t)(hex ? FSCRYPT_KEY_IDENTIFIER_SIZE_HEX : FSCRYPT_KEY_IDENTIFIER_SIZE);
+        	return 0;
+        }
+
+        static inline void* get_policy(const fscrypt_policy* fep)
+        {
+        	if (!fep) return NULL;
+        	if (fep->version == FSCRYPT_POLICY_V1) return (void*)&fep->v1;
+        	if (fep->version == FSCRYPT_POLICY_V2) return (void*)&fep->v2;
+        	return NULL;
+        }
+
+        static inline int fscrypt_policy_size(const fscrypt_policy* fep)
+        {
+        	if (!fep) return 0;
+        	if (fep->version == FSCRYPT_POLICY_V1) return (int)sizeof(struct fscrypt_policy_v1);
+        	if (fep->version == FSCRYPT_POLICY_V2) return (int)sizeof(struct fscrypt_policy_v2);
+        	return 0;
+        }
+
+        static inline void get_policy_content(fscrypt_policy* fep, char* content)
+        {
+        	if (!fep || !content) return;
+        	if (fep->version == FSCRYPT_POLICY_V1) {
+        		snprintf(content, 50, "%i %i %i %i %s", (int)fep->v1.version,
+        			(int)fep->v1.contents_encryption_mode,
+        			(int)fep->v1.filenames_encryption_mode,
+        			(int)fep->v1.flags, fep->v1.master_key_descriptor);
+        	} else if (fep->version == FSCRYPT_POLICY_V2) {
+        		snprintf(content, 50, "%i %i %i %i %s", (int)fep->v2.version,
+        			(int)fep->v2.contents_encryption_mode,
+        			(int)fep->v2.filenames_encryption_mode,
+        			(int)fep->v2.flags, fep->v2.master_key_identifier);
+        	}
+        }
+
+        #endif /* TWRP_FSCRYPT_COMPAT_H */
+
+        CEOF
+        echo "fscrypt_compat.h 已写入：$(wc -c < "$LT/fscrypt_compat.h") 字节"
+
+        echo "=== 2. 把 include 换成兼容头 ==="
+        for F in append.c block.c extract.c libtar.h output.c; do
+          if [ -f "$LT/$F" ]; then
+            sed -i 's|#include "fscrypt_policy.h"|#include "fscrypt_compat.h"|' "$LT/$F"
+            echo "  $F -> $(grep -c 'fscrypt_compat.h' "$LT/$F") 处"
+          fi
+        done
+
+        echo "=== 3. 把调用点改成 vold 14.1 的 v2 重载 ==="
+        sed -i 's|fscrypt_policy_get_struct(realname, t->th_buf.fep)|fscrypt_policy_get_struct(realname, \&t->th_buf.fep->v2)|g' "$LT/append.c"
+        sed -i 's|lookup_ref_key(t->th_buf.fep,|lookup_ref_key(\&t->th_buf.fep->v2,|g' "$LT/append.c"
+        sed -i 's|lookup_ref_tar(t->th_buf.fep,|lookup_ref_tar((const uint8_t*)get_policy_descriptor(t->th_buf.fep),|g' "$LT/extract.c"
+        sed -i 's|fscrypt_policy_set_struct(realname, t->th_buf.fep)|fscrypt_policy_set_struct(realname, \&t->th_buf.fep->v2)|g' "$LT/extract.c"
+
+        echo "=== 4. 校验（任何一项没命中就立刻失败，别白跑 48 分钟）==="
+        FUNCS=$(grep -c '^static inline' "$LT/fscrypt_compat.h" || true)
+        if [ "$FUNCS" -lt 5 ]; then
+          echo "::error::fscrypt_compat.h 只有 $FUNCS 个 helper，应为 5 个"
+          exit 1
+        fi
+        echo "  兼容头 helper 数量: $FUNCS（get_policy_size / get_policy_descriptor / get_policy / fscrypt_policy_size / get_policy_content）"
+        grep -rn '#include "fscrypt_policy.h"' "$LT" && { echo "::error::仍有文件 include 的是旧头"; exit 1; } || echo "  include 已全部替换"
+        grep -n 'fscrypt_policy_get_struct(realname, &t->th_buf.fep->v2)' "$LT/append.c" || { echo "::error::append.c get_struct 未替换"; exit 1; }
+        grep -n 'lookup_ref_key(&t->th_buf.fep->v2' "$LT/append.c" || { echo "::error::append.c lookup_ref_key 未替换"; exit 1; }
+        grep -n 'lookup_ref_tar((const uint8_t\*)get_policy_descriptor(t->th_buf.fep)' "$LT/extract.c" || { echo "::error::extract.c lookup_ref_tar 未替换"; exit 1; }
+        grep -n 'fscrypt_policy_set_struct(realname, &t->th_buf.fep->v2)' "$LT/extract.c" || { echo "::error::extract.c set_struct 未替换"; exit 1; }
+        echo "  全部替换生效"
+        echo "=== libtar 补丁完成 ==="
+
     - name: Set Swap Space
       timeout-minutes: 15
       run: |
