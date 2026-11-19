@@ -247,7 +247,7 @@ jobs:
           bootable system device vendor hardware external 2>/dev/null | head -20 || true
         echo "--- 扫描结束 ---"
 
-    - name: Patch libtar fscrypt API (vold 14)
+    - name: Patch libtar fscrypt API + split libvold_fscrypt (vold 14)
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
       run: |
         set -e
@@ -399,6 +399,108 @@ jobs:
         grep -n 'lookup_ref_tar((const uint8_t\*)get_policy_descriptor(t->th_buf.fep)' "$LT/extract.c" || { echo "::error::extract.c lookup_ref_tar 未替换"; exit 1; }
         grep -n 'fscrypt_policy_set_struct(realname, &t->th_buf.fep->v2)' "$LT/extract.c" || { echo "::error::extract.c set_struct 未替换"; exit 1; }
         echo "  全部替换生效"
+        echo "=== 5. 给 libvold 关 LTO（否则整个 vold 被合成 lto.tmp 拉进 libtar，缺 sysutils/bootclient/async_safe）==="
+        VOLD_BP="system/vold/Android.bp"
+        if [ ! -f "$VOLD_BP" ]; then
+          echo "::error::$VOLD_BP 不存在，关 LTO 补丁无法应用"
+          exit 1
+        fi
+        if grep -q 'lto: { never: true }' "$VOLD_BP"; then
+          echo "  libvold 已禁用 LTO（幂等）"
+        else
+          awk '/^    name: "libvold",$/ && !d {print; print "    lto: { never: true },"; d=1; next} {print}' "$VOLD_BP" > "$VOLD_BP.tmp"
+          mv "$VOLD_BP.tmp" "$VOLD_BP"
+          echo "  libvold 已插入 lto: { never: true }"
+        fi
+        grep -q 'lto: { never: true }' "$VOLD_BP" || { echo "::error::libvold 关 LTO 失败"; exit 1; }
+        grep -n -A1 '^    name: "libvold",$' "$VOLD_BP" || true
+
+        echo "=== 6. libtar 补 vold 的 shared libs（兜底）==="
+        if grep -q 'LOCAL_SHARED_LIBRARIES += libsysutils libboot_control_client' "$LT/Android.mk"; then
+          echo "  已存在（幂等）"
+        else
+          sed -i 's|^    LOCAL_CFLAGS += -DUSE_FSCRYPT$|    LOCAL_SHARED_LIBRARIES += libsysutils libboot_control_client\n    LOCAL_CFLAGS += -DUSE_FSCRYPT|' "$LT/Android.mk"
+          grep -q 'libsysutils libboot_control_client' "$LT/Android.mk" || { echo "::error::libtar 追加 shared libs 失败"; exit 1; }
+          echo "  已追加: libsysutils libboot_control_client"
+        fi
+
+        echo "=== 7. 把 libtar 用到的 vold 部分拆成独立静态库 libvold_fscrypt（彻底隔离整个 libvold）==="
+        if grep -q 'name: "libvold_fscrypt"' "$VOLD_BP"; then
+          echo "  libvold_fscrypt 模块已存在（幂等）"
+        else
+          cat >> "$VOLD_BP" <<'BPEOF'
+        // TWRP: libtar 专用的精简 vold 静态库（7 个源文件的依赖闭包，避免把整个 libvold 拉进链接）
+        cc_library_static {
+            name: "libvold_fscrypt",
+            defaults: [
+                "vold_default_flags",
+                "vold_default_libs",
+                "keystore2_use_latest_aidl_ndk_shared",
+                "vold_defaults"
+            ],
+            recovery_available: true,
+            lto: { never: true },
+            include_dirs: [
+                "system/core/gatekeeperd/include"
+            ],
+            srcs: [
+                "Decrypt.cpp",
+                "fscrypt_policy.cpp",
+                "HashPassword.cpp",
+                "KeyStorage.cpp",
+                "KeyUtil.cpp",
+                "Utils.cpp",
+                "Weaver1.cpp",
+            ],
+            shared_libs: [
+                "android.hardware.confirmationui@1.0",
+                "android.hardware.gatekeeper@1.0",
+                "android.hardware.health.storage@1.0",
+                "android.hardware.health.storage-V1-ndk",
+                "android.hardware.keymaster@4.1",
+                "android.hardware.security.keymint-V3-ndk",
+                "android.hardware.weaver@1.0",
+                "android.security.apc-ndk",
+                "android.system.keystore2-V4-ndk",
+                "android.security.authorization-ndk",
+                "android.security.maintenance-ndk",
+                "libbinder",
+                "libbinder_ndk",
+                "libgatekeeper",
+                "libgatekeeper_aidl",
+                "libhardware",
+                "libhidlbase",
+                "liblog",
+                "libchrome",
+                "libkeymaster4_1support",
+                "libkeystoreinfo",
+                "libkeystore-attestation-application-id",
+                "libkeymint_support",
+                "libkeyutils",
+            ],
+            whole_static_libs: [
+                "libc++fs",
+            ],
+        }
+        BPEOF
+          echo "  已追加 libvold_fscrypt 到 $VOLD_BP"
+        fi
+        grep -q 'name: "libvold_fscrypt"' "$VOLD_BP" || { echo "::error::libvold_fscrypt 模块未写入"; exit 1; }
+        for F in Decrypt.cpp fscrypt_policy.cpp HashPassword.cpp KeyStorage.cpp KeyUtil.cpp Utils.cpp Weaver1.cpp; do
+          [ -f "system/vold/$F" ] || { echo "::error::白名单源文件缺失: system/vold/$F"; exit 1; }
+        done
+        echo "  白名单 7 个源文件全部存在"
+
+        echo "=== 8. 让 libtar 链 libvold_fscrypt 而不是 libvold ==="
+        if grep -q 'LOCAL_STATIC_LIBRARIES += libvold_fscrypt' "$LT/Android.mk"; then
+          echo "  已切换（幂等）"
+        else
+          sed -i 's|^    LOCAL_STATIC_LIBRARIES += libvold libscrypt_static$|    LOCAL_STATIC_LIBRARIES += libvold_fscrypt libscrypt_static|' "$LT/Android.mk"
+          echo "  已执行 libvold -> libvold_fscrypt 替换"
+        fi
+        grep -q 'LOCAL_STATIC_LIBRARIES += libvold_fscrypt libscrypt_static' "$LT/Android.mk" || { echo "::error::libtar 未切到 libvold_fscrypt"; exit 1; }
+        grep -n 'LOCAL_STATIC_LIBRARIES += lib' "$LT/Android.mk"
+
         echo "=== libtar 补丁完成 ==="
 
     - name: Set Swap Space
