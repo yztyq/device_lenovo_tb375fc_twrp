@@ -192,6 +192,32 @@ jobs:
         git clone --depth=1 ${{ github.event.inputs.DEVICE_TREE_URL }} -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} ./${{ github.event.inputs.DEVICE_PATH }}
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
 
+    - name: Unpack FBE vendor prebuilts
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+      run: |
+        set -e
+        DT="./${{ github.event.inputs.DEVICE_PATH }}"
+        ZIPFILE="$DT/vendor_fbe.zip"
+        if [ ! -f "$ZIPFILE" ]; then
+          echo "::warning::$ZIPFILE 不存在，跳过 FBE 预置（构建可继续，但 /data 解密不可用）"
+          exit 0
+        fi
+        echo "=== 解包 FBE 预置 ==="
+        rm -rf "$DT/vendor_fbe"
+        mkdir -p "$DT/vendor_fbe"
+        unzip -o "$ZIPFILE" -d "$DT/vendor_fbe"
+        if [ -d "$DT/vendor_fbe/recovery_root" ]; then
+          mkdir -p "$DT/recovery/root/vendor"
+          cp -rf "$DT/vendor_fbe/recovery_root/." "$DT/recovery/root/"
+          echo "--- lib64 已并入 recovery/root/vendor/lib64 ---"
+        fi
+        chmod 755 "$DT/vendor_fbe/files/bin/hw/"* "$DT/vendor_fbe/files/bin/teei_daemon"
+        echo "=== vendor/bin/hw ==="
+        ls -l "$DT/vendor_fbe/files/bin/hw"
+        echo "=== recovery/root/vendor/lib64（前 8 项）==="
+        ls -l "$DT/recovery/root/vendor/lib64" | head -8
+        echo "=== FBE 预置完成 ==="
+
     - name: Clone common tree
       timeout-minutes: 15
       if: |
@@ -466,7 +492,72 @@ jobs:
         grep -q '^LOCAL_SHARED_LIBRARIES += libsysutils libchrome' "$REC" || { echo "::error::recovery shared 依赖补齐失败"; exit 1; }
         grep -n 'libguitwrp libvold\|TWRP_vold_shared_deps\|LOCAL_SHARED_LIBRARIES += libsysutils' "$REC" || true
 
-        echo "=== libtar / recovery 补丁完成 ==="
+        echo "=== 9. FDE(cryptfs) 兼容层（AOSP 14 删除了 FDE 实现，recovery 仍引用 5 个旧 API）==="
+        CRYPTFS_H=system/vold/cryptfs.h
+        [ -f "$CRYPTFS_H" ] || { echo "::error::找不到 $CRYPTFS_H"; exit 1; }
+        if grep -q 'TWRP_FDE_COMPAT_BEGIN' "$CRYPTFS_H"; then
+          echo "  FDE 兼容层已存在（幂等）"
+        else
+          cat > /tmp/fde_compat_block.txt <<'FDEEOF'
+        /* ===== TWRP_FDE_COMPAT_BEGIN =====
+         * AOSP 14 已彻底移除 FDE（全盘加密）实现，system/vold 只保留 FBE 用的
+         * cryptfs_setup_ext_volume；但 TWRP 14.1 的 recovery/partition.cpp 与
+         * partitionmanager.cpp 仍调用 5 个旧 FDE API，导致 use of undeclared identifier。
+         *
+         * 本机 TB375FC 的 fstab 为 fileencryption=...:v2 + keydirectory=/metadata/...，
+         * 即 FBE + metadata 加密：data 上不存在 FDE crypto footer，FDE 路径运行时不可达。
+         *
+         * 这里按真实硬件语义补齐（不是空桩）：
+         *   - cryptfs_check_footer() 返回“无 FDE 卷”，与 AOSP 14 的状态一致；
+         *   - 其余 API 返回失败并保留调用方原有的错误日志；
+         * 因此 FBE / metadata 解密链路（libtar + libvold + keystore2）完全不受影响；
+         * 若误插到真正的 FDE 设备，行为是“识别为 FDE 但本版本不支持解密”，不会静默破坏数据。
+         *
+         * 若要真正恢复 FDE 解密能力，需移植 AOSP 12.1 的 cryptfs FDE 实现
+         * （crypto footer 读写 + scrypt + master key + dm-crypt 建/删），不在本层范围内。
+         */
+        #ifdef __cplusplus
+        __attribute__((unused)) static inline void set_partition_data(const char* block_device,
+                                                                     const char* key_location) {
+            (void)block_device;
+            (void)key_location;
+        }
+        __attribute__((unused)) static inline int cryptfs_check_footer(void) {
+            /* AOSP 14 不再支持 FDE footer，FBE 设备正确语义即“没有 footer” */
+            return -1;
+        }
+        __attribute__((unused)) static inline int cryptfs_get_password_type(void) {
+            return -1;
+        }
+        __attribute__((unused)) static inline int cryptfs_check_passwd(const char* pw) {
+            (void)pw;
+            return -1;
+        }
+        __attribute__((unused)) static inline int delete_crypto_blk_dev(const std::string& name) {
+            (void)name;
+            return -1;
+        }
+        #endif  /* __cplusplus */
+        /* ===== TWRP_FDE_COMPAT_END ===== */
+        FDEEOF
+          awk -v blk=/tmp/fde_compat_block.txt '
+            BEGIN { done = 0 }
+            /^#endif \/\* ANDROID_VOLD_CRYPTFS_H \*\// && !done {
+              while ((getline line < blk) > 0) print line
+              close(blk); done = 1
+            }
+            { print }
+          ' "$CRYPTFS_H" > "$CRYPTFS_H.tmp"
+          mv "$CRYPTFS_H.tmp" "$CRYPTFS_H"
+          echo "  FDE 兼容层已插入"
+        fi
+        grep -q 'TWRP_FDE_COMPAT_BEGIN' "$CRYPTFS_H" || { echo "::error::FDE 兼容层写入失败"; exit 1; }
+        for sym in set_partition_data cryptfs_check_footer cryptfs_get_password_type cryptfs_check_passwd delete_crypto_blk_dev; do
+          grep -q "static inline.*${sym}(" "$CRYPTFS_H" || { echo "::error::FDE 兼容层缺少 $sym"; exit 1; }
+        done
+        echo "  已覆盖: set_partition_data / cryptfs_check_footer / cryptfs_get_password_type / cryptfs_check_passwd / delete_crypto_blk_dev"
+
+        echo "=== libtar / recovery / cryptfs FDE 补丁完成 ==="
 
     - name: Set Swap Space
       timeout-minutes: 15
