@@ -111,7 +111,7 @@ jobs:
         make --version | head -1
 
     - name: Install OpenJDK
-      uses: actions/setup-java@v4
+      uses: actions/setup-java@v5
       with:
         distribution: 'zulu'
         java-version: '8'
@@ -221,6 +221,31 @@ jobs:
         repo sync -j4 --no-clone-bundle --no-tags
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
       continue-on-error: true
+
+    - name: Patch TWRP sources (Android 14)
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+      run: |
+        set -e
+        for F in bootable/recovery/Android.mk bootable/recovery/libtar/Android.mk; do
+          if [ ! -f "$F" ]; then
+            echo "::warning::$F 不存在，跳过"
+            continue
+          fi
+          echo "--- $F : 修补前的 -ndk_platform 引用 ---"
+          grep -n 'ndk_platform' "$F" || true
+          if grep -q 'ndk_platform' "$F"; then
+            sed -i 's/-ndk_platform/-ndk/g' "$F"
+            echo "=== $F : -ndk_platform -> -ndk ==="
+          else
+            echo "=== $F 无需修补 ==="
+          fi
+          echo "--- $F : 修补后的 android.security.* 依赖 ---"
+          grep -n 'android\.security\.\|android\.system\.keystore2' "$F" || true
+        done
+        echo "--- 全树其他 -ndk_platform 引用（仅报告，不修改）---"
+        timeout 120 grep -rln --include='*.mk' --include='*.bp' 'ndk_platform' \
+          bootable system device vendor hardware external 2>/dev/null | head -20 || true
+        echo "--- 扫描结束 ---"
 
     - name: Set Swap Space
       timeout-minutes: 15
