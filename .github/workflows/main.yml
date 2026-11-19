@@ -77,7 +77,7 @@ jobs:
 
     # You might want to Checkout your repo first, but not mandatory
     - name: Check Out
-      uses: actions/checkout@v4
+      uses: actions/checkout@v5
 
     # Cleanup The Actions Workspace Using Custom Composite Run Actions
     - name: Cleanup
@@ -91,13 +91,28 @@ jobs:
         set -e
         export DEBIAN_FRONTEND=noninteractive
         export TZ=Asia/Shanghai
-        sudo apt-get update -y
-        sudo apt-get install -y --no-install-recommends \
-          bc bison build-essential ccache curl flex g++-multilib gcc-multilib \
-          git gnupg gperf imagemagick lib32z1-dev libelf-dev liblz4-tool \
-          libncurses-dev libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop \
-          pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev \
-          unzip python3 python-is-python3 libbz2-dev lzma tree
+        # GitHub runner 默认走 azure.archive.ubuntu.com，偶发不可达（上一轮就是它 exit 100）
+        # 因此：先按原源试一次，失败则切回官方 archive.ubuntu.com 再试，最多 3 轮
+        apt_install_main() {
+          sudo apt-get update -y || return 1
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache curl flex g++-multilib gcc-multilib \
+            git gnupg gperf imagemagick lib32z1-dev libelf-dev liblz4-tool \
+            libncurses-dev libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop \
+            pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev \
+            unzip python3 python-is-python3 libbz2-dev lzma tree
+        }
+        ok=0
+        for attempt in 1 2 3; do
+          echo "=== apt 主依赖安装 第 $attempt 轮 ==="
+          if apt_install_main; then ok=1; break; fi
+          echo "::warning::apt 第 $attempt 轮失败，切换镜像源后重试"
+          sudo sed -i 's|azure.archive.ubuntu.com|archive.ubuntu.com|g' /etc/apt/apt-mirrors.txt 2>/dev/null || true
+          sudo sed -i 's|azure.archive.ubuntu.com|archive.ubuntu.com|g' /etc/apt/sources.list 2>/dev/null || true
+          sudo rm -rf /var/lib/apt/lists/* 2>/dev/null || true
+          sleep 5
+        done
+        [ "$ok" = 1 ] || { echo "::error::apt 主依赖 3 轮均失败，源不可用"; exit 1; }
         # 可选包装一个装一个，装不上就跳过，绝不因一个缺包把整条流水线卡死
         for p in gcc-10-multilib g++-10-multilib lib32ncurses-dev lib32readline-dev \
                    libwxgtk3.0-gtk3-dev libncurses5 libgl1-mesa-dev x11proto-core-dev \
@@ -555,13 +570,13 @@ jobs:
 
     - name: Upload build log
       if: always()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
         name: build-log-${{ github.run_id }}
         path: |
           artifacts/repo-sync.log
           artifacts/build.log
-        if-no-files-found: warn
+        if-no-files-found: ignore
         retention-days: 7
 
     - name: Collect artifacts
